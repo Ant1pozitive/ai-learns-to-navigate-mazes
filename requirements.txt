@@ -1,0 +1,9 @@
+numpy
+torch
+matplotlib
+Pillow
+imageio
+imageio-ffmpeg
+tqdm
+streamlit
+tensorboard
