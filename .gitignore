@@ -1,1 +1,43 @@
-outputs
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ipynb_checkpoints/
+
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+
+# OS
+.DS_Store
+Thumbs.db
+
+
+# IDEs
+.vscode/
+.idea/
+
+
+# Outputs / artifacts
+outputs/
+*.log
+*.png
+*.gif
+*.mp4
+*.pth
+frames/
+final_frames/
+
+
+# Packaging
+*.egg-info/
+.dist-info/
+
+
+# Misc
+.env
