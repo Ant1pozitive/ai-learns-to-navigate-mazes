@@ -785,7 +785,7 @@ def run_streamlit():
                 if pil.size[0] != 800:
                     new_h = int(pil.size[1] * (800 / pil.size[0]))
                     pil = pil.resize((800, new_h), Image.LANCZOS)
-                preview.image(pil, use_container_width=False)
+                preview.image(pil, width='content')
             reward_history.append(ep_reward)
             avg = float(np.mean(reward_history[-50:])) if reward_history else ep_reward
             avg_history.append(avg)
