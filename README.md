@@ -30,10 +30,3 @@ python main.py --size 21 --episodes 300
 ```
 
 Artifacts (GIF/MP4, rewards plot, model) saved to outputs/.
-
-ToDo:
-  * advanced settings in web
-  * smoothing training video
-  * adaptive frames_per_step
-  * write readme
-  * files structure
