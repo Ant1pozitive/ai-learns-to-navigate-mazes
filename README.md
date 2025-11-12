@@ -12,3 +12,4 @@ ToDo:
   * smoothing training video
   * adaptive frames_per_step
   * write readme
+  * files structure
