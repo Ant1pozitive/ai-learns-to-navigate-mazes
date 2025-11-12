@@ -1,9 +1,13 @@
+# Minimal runtime requirements
 numpy
 torch
+pillow
 matplotlib
-Pillow
 imageio
 imageio-ffmpeg
 tqdm
 streamlit
+
+
+# Optional but recommended
 tensorboard
