@@ -918,14 +918,14 @@ def run_streamlit():
             c1, c2 = artifacts.columns(2)
             with c1:
                 if artifacts_info.get("preview_gif") and os.path.exists(artifacts_info["preview_gif"]):
-                    c1.image(artifacts_info["preview_gif"], caption="Training preview GIF", use_container_width=True)
+                    c1.image(artifacts_info["preview_gif"], caption="Training preview GIF", width='content')
                 if artifacts_info.get("plot") and os.path.exists(artifacts_info["plot"]):
-                    c1.image(artifacts_info["plot"], caption="Rewards", use_container_width=True)
+                    c1.image(artifacts_info["plot"], caption="Rewards", width='content')
             with c2:
                 if artifacts_info.get("final_mp4") and os.path.exists(artifacts_info["final_mp4"]):
                     c2.video(artifacts_info["final_mp4"])
                 if artifacts_info.get("final_gif") and os.path.exists(artifacts_info["final_gif"]):
-                    c2.image(artifacts_info["final_gif"], caption="Final smooth GIF", use_container_width=True)
+                    c2.image(artifacts_info["final_gif"], caption="Final smooth GIF", width='content')
             artifacts.markdown(f"- Model: `{artifacts_info.get('model','')}`  \n- Log: `{artifacts_info.get('log','')}`")
         except Exception:
             logger.exception("Failed showing artifacts in Streamlit UI")
