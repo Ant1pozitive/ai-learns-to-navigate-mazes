@@ -13,8 +13,6 @@ Users can observe how the agent improves over time - from random wandering to ne
 
 ![preview](https://github.com/user-attachments/assets/19db8b49-5816-477c-a994-fa9f86622161)
 
-![thoughts](https://github.com/user-attachments/assets/8c8ad3bf-3b15-406d-8120-8650812fce18)
-
 
 ---
 
