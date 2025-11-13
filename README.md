@@ -29,8 +29,13 @@ pip install torch torchvision torchaudio --index-url https://download.pytorch.or
 ```
 
 ### 3. Run the app
+* Web:
 ```bash
 streamlit run main.py -- --web
+```
+* CLI:
+```bash
+python main.py --size 21 --episodes 300
 ```
 
 ---
