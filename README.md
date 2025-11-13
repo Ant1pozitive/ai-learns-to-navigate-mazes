@@ -8,6 +8,8 @@ This project demonstrates how a reinforcement learning (RL) agent learns to navi
 It combines **deep Q-learning**, **GPU acceleration**, and **real-time visualization** using Streamlit.
 
 Users can observe how the agent improves over time - from random wandering to near-optimal navigation - with a clear “thinking overlay” that reveals the agent’s internal decision probabilities.
+
+
 ![preview](https://github.com/user-attachments/assets/19db8b49-5816-477c-a994-fa9f86622161)
 
 
