@@ -30,7 +30,7 @@ pip install torch torchvision torchaudio --index-url https://download.pytorch.or
 
 ### 3. Run the app
 ```bash
-streamlit run RL.py -- --web
+streamlit run main.py -- --web
 ```
 
 ---
