@@ -74,9 +74,9 @@ python main.py --size 21 --episodes 300
 * outputs/dqn_model.pth - trained model weights.
 * outputs/rewards.png - training reward curve.
 * outputs/final_animation_30fps.mp4 - high-quality final video (if ffmpeg available).
-* outputs/training_preview.gif - compact preview GIF created during training.
+* outputs/preview.gif - compact preview GIF created during training.
 * outputs/train.log - logging output for debugging/analysis.
-* outputs/frames/ - optional saved frames (if enabled).
+* outputs/final_frames/ - optional saved frames (if enabled).
 
 ---
 
