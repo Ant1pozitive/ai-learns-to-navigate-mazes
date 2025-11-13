@@ -60,7 +60,7 @@ streamlit run RL.py -- --web
 * --size: Maze size (odd integer).
 * --episodes: Number of training episodes.
 * Observation type: selected in Streamlit — vector, grid, or egocentric (local patch centered on the agent).
-* Other hyperparameters are defined in-code with sensible defaults. If you want to expose more knobs, modify Config inside main.py.
+* Other hyperparameters are defined in-code with sensible defaults. If you want to expose more knobs, modify Config inside main.py or use Advanced settings in web.
 
 ---
 
