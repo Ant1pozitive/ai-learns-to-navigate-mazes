@@ -12,6 +12,7 @@ import io
 from collections import deque
 
 import numpy as np
+import pandas as pd
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 import imageio
 from tqdm import trange
@@ -21,7 +22,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
-
 
 # Logging / outputs
 OUTPUT_DIR = "outputs"
@@ -37,8 +37,7 @@ ch.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
 ch.setLevel(logging.INFO)
 logger.addHandler(fh); logger.addHandler(ch)
 
-
-# Configuration
+# Config
 @dataclass
 class Config:
     maze_size: int = 21
@@ -87,7 +86,6 @@ class Config:
         cfg.tensorboard_logdir = os.path.join(cfg.output_dir, "tb")
         return cfg
 
-
 # Utilities
 def set_seed(seed:int):
     random.seed(seed)
@@ -133,16 +131,14 @@ def generate_thoughts(q_values: Optional[np.ndarray],
 
     actions = ["right", "down", "left", "up"]
     idx_sorted = list(np.argsort(probs)[::-1])
-    top_idx = int(idx_sorted[0])
-    top_p = float(probs[top_idx])
-    second_idx = int(idx_sorted[1])
-    second_p = float(probs[second_idx])
+    top_idx = int(idx_sorted[0]); top_p = float(probs[top_idx])
+    second_idx = int(idx_sorted[1]); second_p = float(probs[second_idx])
     entropy = -np.sum([p * math.log(p+1e-12) for p in probs])
     prob_std = float(np.std(probs))
 
-    openers = ["Thinking out loud,", "Hmm—", "I estimate", "My thought:", "I lean toward", "Tentative plan:", "Observation:", "Quick read:"]
-    confidences = ["I have strong confidence", "I'm somewhat confident", "I'm uncertain", "It's ambiguous", "The model favors", "The model slightly prefers"]
-    connectors = ["—", ":", ";", ", but", ", however", "."]
+    openers = ["Thinking out loud,", "Hmm-", "I estimate", "My thought:", "I lean toward", "Tentative plan:", "Observation:", "Quick read:"]
+    confidences = ["I have strong confidence", "I'm somewhat confident", "I'm uncertain", "It's ambiguous", "The model favors", "Slight preference"]
+    connectors = ["-", ":", ";", ", but", ", however", "."]
     endings = ["", "Let's try that.", "Worth trying.", "I'll explore that.", "I'll give it a shot."]
     alt_templates = ["Alternative is {alt} ({alt_p}%).", "Second choice: {alt} ({alt_p}%).", "Also considering {alt} ({alt_p}%)."]
 
@@ -184,8 +180,7 @@ def generate_thoughts(q_values: Optional[np.ndarray],
     recent_cache.append(candidate)
     return candidate
 
-
-# Maze generator
+# Maze generator & Env & render
 class MazeGenerator:
     @staticmethod
     def generate(size:int, seed:Optional[int]=None) -> Tuple[np.ndarray, Tuple[int,int], Tuple[int,int]]:
@@ -209,8 +204,6 @@ class MazeGenerator:
         maze[0,1] = 0; maze[size-1,size-2] = 0
         return maze, start, goal
 
-
-# Environment + render
 class MazeEnv:
     def __init__(self, maze:np.ndarray, start:Tuple[int,int], goal:Tuple[int,int]):
         self.maze = maze
@@ -355,7 +348,7 @@ class MazeEnv:
         return np.array(img, dtype=np.uint8)
 
 
-# Replay buffers & models
+# Replay, models, agent
 class PrioritizedReplayBuffer:
     def __init__(self, capacity:int, alpha:float=0.6):
         self.capacity = int(capacity); self.alpha = float(alpha)
@@ -497,8 +490,7 @@ class Agent:
         td_err = (q_vals - targets).detach().abs().cpu().numpy()
         return float(loss.item()), td_err
 
-
-# Observation
+# Observations
 def build_obs_vector(state:Tuple[int,int], goal:Tuple[int,int], size:int)->torch.Tensor:
     sx, sy = state; gx, gy = goal
     return torch.tensor([sx/(size-1), sy/(size-1), gx/(size-1), gy/(size-1)], dtype=torch.float32)
@@ -535,7 +527,6 @@ class EgocentricBuilder:
         patch_heat = self.padded_heat[r:r+H, c:c+H].copy()
         ch = np.stack([patch_maze, patch_heat], axis=0)
         return torch.tensor(ch, dtype=torch.float32)
-
 
 # Training loop
 ProgressCB = Callable[[int,int,float,float,float,int,Optional[np.ndarray], str], None]
@@ -576,6 +567,8 @@ def train(cfg:Config, progress_cb:Optional[ProgressCB]=None)->Dict[str,str]:
     global_step = 0
 
     recent_thoughts = deque(maxlen=60)
+    last_progress_time = 0.0
+    min_update_interval = 0.4  # seconds between UI updates
 
     eps_iter = trange(cfg.episodes, desc="Training", unit="ep", ncols=80)
     for ep in eps_iter:
@@ -661,12 +654,19 @@ def train(cfg:Config, progress_cb:Optional[ProgressCB]=None)->Dict[str,str]:
 
             thought_text = generate_thoughts(qvals, recent_thoughts, rng, temperature=1.0)
 
-            if progress_cb is not None and (ep_steps % 5 == 0):
-                avg10 = float(np.mean(rewards[-10:])) if len(rewards) >= 10 else (float(np.mean(rewards)) if rewards else 0.0)
+            now = time.time()
+            if progress_cb is not None and (now - last_progress_time >= min_update_interval):
                 try:
+                    avg10 = float(np.mean(rewards[-10:])) if len(rewards) >= 10 else (float(np.mean(rewards)) if rewards else 0.0)
                     progress_cb(ep+1, cfg.episodes, ep_reward, avg10, eps, ep_steps, last_preview_frame, thought_text)
-                except Exception:
-                    logger.exception("progress_cb error")
+                except Exception as e:
+                    # If client disconnected (StreamClosed / WebSocketClosed), just log at debug and continue training
+                    msg = str(e)
+                    if 'StreamClosedError' in msg or 'WebSocketClosedError' in msg or 'BrokenPipeError' in msg:
+                        logger.info("Client disconnected; skipping UI update (non-fatal).")
+                    else:
+                        logger.exception("progress_cb error")
+                last_progress_time = now
 
         rewards.append(ep_reward)
         tb.add_scalar("train/episode_reward", float(ep_reward), ep)
@@ -714,8 +714,7 @@ def train(cfg:Config, progress_cb:Optional[ProgressCB]=None)->Dict[str,str]:
         "log": LOG_PATH
     }
 
-
-# Final rendering (same)
+# Final rendering
 def final_render_and_save(agent:Agent, env:MazeEnv, cfg:Config, egobuilder:Optional[EgocentricBuilder]):
     try:
         s = env.reset(); path=[s]; done=False; steps=0; max_eval = cfg.maze_size**2 * 5
@@ -791,45 +790,28 @@ def final_render_and_save(agent:Agent, env:MazeEnv, cfg:Config, egobuilder:Optio
 
     return {"gif": gif_path if os.path.exists(gif_path) else "", "mp4": mp4_path if os.path.exists(mp4_path) else ""}
 
-
-# Streamlit UI with right-side thoughts
+# Streamlit UI
 def run_streamlit():
     import streamlit as st
     st.set_page_config(page_title="AI Learns to Navigate Mazes", layout="wide")
     st.title("AI Learns to Navigate Mazes")
 
-    tabs = st.tabs(["Main", "Advanced settings"])
-    main_tab = tabs[0]; adv_tab = tabs[1]
+    left_col, center_col, right_col = st.columns([1,3,1])
+    with left_col:
+        size = st.slider("Maze size (odd)", 11, 41, 21, step=2)
+        episodes = st.slider("Episodes", 50, 1000, 300, step=50)
+        obs_type = st.selectbox("Observation type", ['vector','grid','egocentric'], index=0)
+        start_btn = st.button("🚀 Start training")
+        st.markdown("**Preview updates during training; final smooth video is produced after training.**")
 
-    with main_tab:
-        left_col, center_col, right_col = st.columns([1,3,1])
-        with left_col:
-            size = st.slider("Maze size (odd)", 11, 41, 21, step=2)
-            episodes = st.slider("Episodes", 50, 1000, 300, step=50)
-            obs_type = st.selectbox("Observation type", ['vector','grid','egocentric'], index=0)
-            start_btn = st.button("🚀 Start training")
-            st.markdown("**Note:** preview updates during training; final smooth video is produced after training.")
-        with center_col:
-            status = st.empty()
-            preview = st.empty()
-            chart = st.empty()
-            artifacts = st.empty()
-        with right_col:
-            st.markdown("### Agent thoughts")
-            thoughts_box = st.empty()
-            st.caption("Latest agent thoughts (newest on top)")
-
-    with adv_tab:
-        st.subheader("Advanced settings (override defaults)")
-        col1, col2 = st.columns(2)
-        with col1:
+        # Advanced settings in an expander
+        with st.expander("Advanced settings"):
             device = st.selectbox("Device", ['auto','cuda','cpu'], index=0)
             batch_size = st.number_input("Batch size", min_value=8, max_value=2048, value=64, step=8)
             lr = st.number_input("Learning rate", value=5e-4, format="%.6f")
             gamma = st.number_input("Gamma (discount)", value=0.99, format="%.4f")
             seed = st.number_input("Seed", min_value=0, max_value=999999, value=42, step=1)
             target_update_steps = st.number_input("Target update steps", min_value=1, max_value=100000, value=1000, step=1)
-        with col2:
             replay_capacity = st.number_input("Replay capacity", min_value=1000, max_value=200000, value=30000, step=1000)
             use_per = st.checkbox("Use PER (Prioritized Replay)", value=True)
             per_alpha = st.slider("PER alpha", 0.0, 1.0, 0.6)
@@ -837,31 +819,77 @@ def run_streamlit():
             min_replay_size = st.number_input("Min replay size before updates", min_value=128, max_value=100000, value=1000, step=128)
             max_grad_norm = st.number_input("Max grad norm", min_value=0.1, max_value=100.0, value=10.0, step=0.1)
 
-    # UI-side recent thoughts (display buffer)
-    ui_recent_thoughts = deque(maxlen=10)
+    with center_col:
+        status = st.empty()
+        preview = st.empty()
+        chart_placeholder = st.empty()
+        if "chart_handle" not in st.session_state:
+            st.session_state.chart_handle = None
+            st.session_state.chart_df = pd.DataFrame(columns=["reward", "avg50"])
+        artifacts = st.empty()
+
+    with right_col:
+        st.markdown("### Agent thoughts (recent)")
+        thoughts_box = st.empty()
+        st.caption("Latest 10 generated thoughts (newest on top)")
+        ui_recent_thoughts = deque(maxlen=10)
 
     reward_history = []; avg_history=[]
 
     def progress_cb(ep, total, ep_reward, avg10, eps, steps, frame, thought_text):
         try:
             if frame is not None:
-                pil = Image.fromarray(frame)
-                preview.image(pil, width='content')
+                try:
+                    pil = Image.fromarray(frame)
+                    preview.image(pil, width='content')
+                except Exception as e:
+                    logger.debug("Preview image update failed: %s", e)
+
             reward_history.append(ep_reward)
             avg = float(np.mean(reward_history[-50:])) if reward_history else ep_reward
             avg_history.append(avg)
-            chart.line_chart({"reward": reward_history, "avg50": avg_history})
+
+            new_row = pd.DataFrame({"reward":[ep_reward], "avg50":[avg]})
+
+            if st.session_state.chart_handle is None:
+                st.session_state.chart_df = pd.DataFrame({"reward": reward_history, "avg50": avg_history})
+                try:
+                    st.session_state.chart_handle = chart_placeholder.line_chart(st.session_state.chart_df)
+                except Exception as e:
+                    logger.exception("Failed to create initial chart: %s", e)
+                    st.session_state.chart_handle = None
+            else:
+                try:
+                    st.session_state.chart_handle.add_rows(new_row)
+                except Exception as e:
+                    logger.debug("add_rows failed, recreating chart: %s", e)
+                    try:
+                        st.session_state.chart_df = pd.DataFrame({"reward": reward_history, "avg50": avg_history})
+                        st.session_state.chart_handle = chart_placeholder.line_chart(st.session_state.chart_df)
+                    except Exception:
+                        logger.exception("Failed to recreate chart")
+
+            # update status text
             status.markdown(f"**Ep**: {ep}/{total}  **Reward**: {ep_reward:.2f}  **Avg50**: {avg:.2f}  **Eps**: {eps:.3f}  **Steps**: {steps}")
 
-            # maintain UI recent thoughts (newest first)
+            # update thoughts: newest first, keep <=10 items
             if thought_text is not None:
                 ts = time.strftime("%H:%M:%S")
                 entry = f"{ts} — {thought_text}"
                 ui_recent_thoughts.appendleft(entry)  # newest at left
                 md = "\n".join([f"- {e}" for e in ui_recent_thoughts])
-                thoughts_box.markdown(md)
-        except Exception:
-            logger.exception("progress_cb failed")
+                try:
+                    thoughts_box.markdown(md)
+                except Exception as e:
+                    logger.debug("Thoughts update failed: %s", e)
+
+        except Exception as e:
+            # catch-all to prevent UI write problems from killing the training
+            msg = str(e)
+            if 'StreamClosedError' in msg or 'WebSocketClosedError' in msg or 'BrokenPipeError' in msg:
+                logger.info("Client disconnected; skipped UI update")
+            else:
+                logger.exception("Unexpected error in progress_cb")
 
     if start_btn:
         cfg = Config.from_args(argparse.Namespace(size=size, episodes=episodes))
