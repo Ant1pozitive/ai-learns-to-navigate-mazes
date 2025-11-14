@@ -49,7 +49,7 @@ python main.py --size 21 --episodes 300
 
 - Procedural maze generation (perfect maze by DFS).
 - DQN agent with prioritized replay (PER), dueling network architecture and target network updates.
-- Observation modalities: `vector` (classic DQN state representation), `grid` (vision-based observation with local field of view), and `egocentric` (local patch + goal heatmap).
+- Observation modalities: `vector` (classic DQN state representation), `grid` (vision-based observation with local field of view), `egocentric` (local patch + goal heatmap) and radar (8 rays + relative goal distance & angle).
 - Smooth final video export (MP4/GIF) with annotated overlays: agent sprite, path gradient, per-action probabilities (thinking overlay) and Q-value bars.
 - GPU-aware implementation (uses CUDA if available).
 - Streamlit interactive UI for fast demos and real-time previews.
