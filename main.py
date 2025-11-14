@@ -7,12 +7,10 @@ import random
 import time
 import math
 from dataclasses import dataclass
-from typing import Tuple, List, Optional, Callable, Dict, Any
-import io
+from typing import Tuple, List, Optional, Callable, Dict
 from collections import deque
 
 import numpy as np
-import pandas as pd
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 import imageio
 from tqdm import trange
@@ -21,28 +19,23 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.tensorboard import SummaryWriter
 
-# Logging / outputs
+# logging
 OUTPUT_DIR = "outputs"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 LOG_PATH = os.path.join(OUTPUT_DIR, "train.log")
 logger = logging.getLogger("ai_maze")
-logger.setLevel(logging.DEBUG)
-fh = logging.FileHandler(LOG_PATH, mode='w', encoding='utf-8')
-fh.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
-fh.setLevel(logging.DEBUG)
-ch = logging.StreamHandler()
-ch.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
-ch.setLevel(logging.INFO)
-logger.addHandler(fh); logger.addHandler(ch)
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    ch = logging.StreamHandler()
+    ch.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+    logger.addHandler(ch)
 
-# Config
 @dataclass
 class Config:
     maze_size: int = 21
     episodes: int = 300
-    obs_type: str = 'vector'  # 'vector','grid','egocentric'
+    obs_type: str = 'vector'  # vector, grid, egocentric, radar
 
     device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
     batch_size: int = 64
@@ -57,13 +50,13 @@ class Config:
     per_beta_frames: int = 100000
     min_replay_size: int = 1000
     max_grad_norm: float = 10.0
+    n_step: int = 3
 
     render_interval: int = 10
     train_frames_per_step: int = 2
     final_frames_per_step: int = 12
     preview_width: int = 800
     final_width: int = 1024
-    save_frames_during_training: bool = False
     save_final_frames: bool = True
     save_mp4: bool = True
 
@@ -79,6 +72,9 @@ class Config:
     epsilon_final: float = 0.02
     epsilon_decay_frames: int = 40000
 
+    use_scheduler: bool = True
+    scheduler_patience: int = 10
+
     @classmethod
     def from_args(cls, args):
         cfg = cls(maze_size=args.size, episodes=args.episodes)
@@ -86,7 +82,6 @@ class Config:
         cfg.tensorboard_logdir = os.path.join(cfg.output_dir, "tb")
         return cfg
 
-# Utilities
 def set_seed(seed:int):
     random.seed(seed)
     np.random.seed(seed)
@@ -100,87 +95,64 @@ def softmax_safe_np(x: Optional[np.ndarray], temp: float = 1.0) -> Optional[np.n
     if x is None:
         return None
     x = np.asarray(x, dtype=np.float64)
-    if not np.isfinite(x).all():
-        x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+    x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
     t = max(1e-6, float(temp))
     x = x / t
     x = x - x.max()
     exps = np.exp(x)
     s = exps.sum()
     if s <= 0:
-        return np.ones_like(x, dtype=np.float32) / float(x.size)
+        return np.ones_like(x, dtype=np.float32)/float(x.size)
     return (exps / s).astype(np.float32)
 
-
-# Thoughts generator
 def generate_thoughts(q_values: Optional[np.ndarray],
                       recent_cache: deque,
                       rng: random.Random,
                       temperature: float = 1.0,
-                      max_attempts: int = 12) -> str:
+                      max_attempts: int = 10) -> str:
     if q_values is None:
         base = "No action probabilities available yet."
         recent_cache.append(base)
         return base
-
     probs = softmax_safe_np(np.asarray(q_values, dtype=np.float32), temp=temperature)
     if probs is None:
         base = "No action probabilities available yet."
         recent_cache.append(base)
         return base
-
     actions = ["right", "down", "left", "up"]
     idx_sorted = list(np.argsort(probs)[::-1])
     top_idx = int(idx_sorted[0]); top_p = float(probs[top_idx])
     second_idx = int(idx_sorted[1]); second_p = float(probs[second_idx])
-    entropy = -np.sum([p * math.log(p+1e-12) for p in probs])
-    prob_std = float(np.std(probs))
-
-    openers = ["Thinking out loud,", "Hmm-", "I estimate", "My thought:", "I lean toward", "Tentative plan:", "Observation:", "Quick read:"]
-    confidences = ["I have strong confidence", "I'm somewhat confident", "I'm uncertain", "It's ambiguous", "The model favors", "Slight preference"]
-    connectors = ["-", ":", ";", ", but", ", however", "."]
-    endings = ["", "Let's try that.", "Worth trying.", "I'll explore that.", "I'll give it a shot."]
-    alt_templates = ["Alternative is {alt} ({alt_p}%).", "Second choice: {alt} ({alt_p}%).", "Also considering {alt} ({alt_p}%)."]
-
+    openers = ["Thinking out loud,", "Hmm—", "I estimate", "My thought:", "I lean toward", "Tentative plan:", "Observation:"]
+    endings = ["", "Let's try that.", "Worth trying.", "I'll explore that."]
     templates = [
         lambda: f"{rng.choice(openers)} go {actions[top_idx]} ({int(100*top_p)}%).",
         lambda: f"{rng.choice(openers)} {actions[top_idx]} ({int(100*top_p)}%) over {actions[second_idx]} ({int(100*second_p)}%).",
-        lambda: f"{rng.choice(openers)} I'm inclined to go {actions[top_idx]} — {int(100*top_p)}% confidence{rng.choice(connectors)} {rng.choice(endings)}",
-        lambda: f"{rng.choice(openers)} probabilities are close; {actions[top_idx]} ~{int(100*top_p)}%, {actions[second_idx]} ~{int(100*second_p)}%.",
-        lambda: f"{rng.choice(confidences)} to choose {actions[top_idx]} ({int(100*top_p)}%). {rng.choice(endings)}",
-        lambda: f"{rng.choice(openers)} results are ambiguous: {', '.join([f'{actions[i]} {int(100*probs[i])}%' for i in range(len(actions))])}.",
-        lambda: f"I'd try {actions[top_idx]} (p={top_p:.2f}). {rng.choice(alt_templates).format(alt=actions[second_idx], alt_p=int(100*second_p))}"
+        lambda: f"{rng.choice(openers)} probabilities are close; {actions[top_idx]} ~{int(100*top_p)}%, {actions[second_idx]} ~{int(100*second_p)}%."
     ]
-
-    adjectives = ["likely", "plausible", "promising", "risky", "reasonable", "uncertain"]
-    hedges = ["maybe", "perhaps", "might", "could be", "I guess", "I suspect"]
-
+    adjectives = ["likely", "plausible", "promising", "risky", "uncertain"]
+    hedges = ["maybe", "perhaps", "might", "could be", "I guess"]
     candidate = None
-    for attempt in range(max_attempts):
-        tmpl = rng.choice(templates)
-        s = tmpl()
+    for _ in range(max_attempts):
+        s = rng.choice(templates)()
         if rng.random() < 0.25:
             s = s.rstrip('.') + f", {rng.choice(hedges)}."
         if rng.random() < 0.15:
             s = s + f" [{rng.choice(adjectives)}]"
         s = s.replace("  ", " ").strip()
-
         if s in recent_cache:
-            s2 = s + (" " + rng.choice(["Let's test it.", "I'll check that.", "Confirming..."]))
+            s2 = s + (" " + rng.choice(["Let's test it.", "Confirming..."]))
             if s2 not in recent_cache:
                 s = s2
             else:
                 continue
         candidate = s
         break
-
     if candidate is None:
         candidate = f"Prefer {actions[top_idx]} ({int(100*top_p)}%)."
-
     recent_cache.append(candidate)
     return candidate
 
-# Maze generator & Env & render
 class MazeGenerator:
     @staticmethod
     def generate(size:int, seed:Optional[int]=None) -> Tuple[np.ndarray, Tuple[int,int], Tuple[int,int]]:
@@ -212,6 +184,7 @@ class MazeEnv:
         self.state = start
         self.actions = [(0,1),(1,0),(0,-1),(-1,0)]
         self.size = maze.shape[0]
+        self._font = ImageFont.load_default()
 
     def reset(self)->Tuple[int,int]:
         self.state = self.start
@@ -254,7 +227,6 @@ class MazeEnv:
         n = self.size
         cell_px = max(4, width // n)
         W = n*cell_px; H = n*cell_px
-
         wall = (20,20,20)
         tile_a = (245,245,240)
         tile_b = (235,235,230)
@@ -296,7 +268,7 @@ class MazeEnv:
             bd.ellipse([cx-r,cy-r,cx+r,cy+r], fill=color+(255,), outline=(255,255,255,200), width=1)
             if label:
                 try:
-                    fnt = ImageFont.load_default(); bd.text((cx+r+2, cy-r), label, fill=(255,255,255,220), font=fnt)
+                    bd.text((cx+r+2, cy-r), label, fill=(255,255,255,220), font=self._font)
                 except Exception:
                     pass
             return base.convert("RGB")
@@ -337,7 +309,7 @@ class MazeEnv:
 
         if overlay_text:
             try:
-                d2 = ImageDraw.Draw(img); fnt = ImageFont.load_default()
+                d2 = ImageDraw.Draw(img); fnt = self._font
                 pad = 6
                 wtxt, htxt = d2.textsize(overlay_text, font=fnt)
                 d2.rectangle([6,6, 6+wtxt+pad*2, 6+htxt+pad*2], fill=(0,0,0,160))
@@ -347,8 +319,6 @@ class MazeEnv:
 
         return np.array(img, dtype=np.uint8)
 
-
-# Replay, models, agent
 class PrioritizedReplayBuffer:
     def __init__(self, capacity:int, alpha:float=0.6):
         self.capacity = int(capacity); self.alpha = float(alpha)
@@ -429,7 +399,7 @@ class Agent:
     def __init__(self, action_dim:int, cfg:Config, obs_shape:Dict[str,int]):
         self.cfg = cfg; self.device = torch.device(cfg.device); self.action_dim = action_dim
         self.obs_type = cfg.obs_type
-        if cfg.obs_type == 'vector':
+        if cfg.obs_type in ('vector', 'radar'):
             self.policy = DuelingMLP(obs_shape['state_dim'], action_dim).to(self.device)
             self.target = DuelingMLP(obs_shape['state_dim'], action_dim).to(self.device)
         else:
@@ -439,26 +409,21 @@ class Agent:
         self.target.load_state_dict(self.policy.state_dict())
         self.optimizer = optim.Adam(self.policy.parameters(), lr=cfg.lr)
         self.step_count = 0
+        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, patience=cfg.scheduler_patience, factor=0.5) if cfg.use_scheduler else None
 
     def act(self, obs:torch.Tensor, epsilon:float)->int:
         if random.random() < epsilon:
             return random.randrange(self.action_dim)
         self.policy.eval()
         with torch.no_grad():
-            if obs.dim() == 1:
-                obs_t = obs.to(self.device).unsqueeze(0)
-            else:
-                obs_t = obs.to(self.device).unsqueeze(0)
+            obs_t = obs.to(self.device).unsqueeze(0) if obs.dim() == 1 else obs.to(self.device).unsqueeze(0)
             q = self.policy(obs_t)
             return int(q.argmax(dim=1).item())
 
     def q_values(self, obs:torch.Tensor)->np.ndarray:
         self.policy.eval()
         with torch.no_grad():
-            if obs.dim() == 1:
-                obs_t = obs.to(self.device).unsqueeze(0)
-            else:
-                obs_t = obs.to(self.device).unsqueeze(0)
+            obs_t = obs.to(self.device).unsqueeze(0) if obs.dim() == 1 else obs.to(self.device).unsqueeze(0)
             q = self.policy(obs_t).cpu().numpy().squeeze(0)
             return q
 
@@ -490,7 +455,6 @@ class Agent:
         td_err = (q_vals - targets).detach().abs().cpu().numpy()
         return float(loss.item()), td_err
 
-# Observations
 def build_obs_vector(state:Tuple[int,int], goal:Tuple[int,int], size:int)->torch.Tensor:
     sx, sy = state; gx, gy = goal
     return torch.tensor([sx/(size-1), sy/(size-1), gx/(size-1), gy/(size-1)], dtype=torch.float32)
@@ -518,43 +482,54 @@ class EgocentricBuilder:
         if heat.max() > 0:
             heat = heat / float(heat.max())
         self.padded_heat = np.pad(heat, pad_width=pad, mode='constant', constant_values=0.0)
-
     def get(self, state:Tuple[int,int])->torch.Tensor:
-        r,c = state
-        pr = self.patch_radius
-        H = 2*pr + 1
+        r,c = state; pr = self.patch_radius; H = 2*pr + 1
         patch_maze = self.padded_maze[r:r+H, c:c+H].copy()
         patch_heat = self.padded_heat[r:r+H, c:c+H].copy()
         ch = np.stack([patch_maze, patch_heat], axis=0)
         return torch.tensor(ch, dtype=torch.float32)
 
-# Training loop
+class RadarBuilder:
+    def __init__(self, maze:np.ndarray, goal:Tuple[int,int], max_range:int = None):
+        self.maze = maze; self.goal = goal; self.size = maze.shape[0]
+        self.max_range = max_range if max_range is not None else self.size
+        self.dirs = [(0,1),(1,1),(1,0),(1,-1),(0,-1),(-1,-1),(-1,0),(-1,1)]
+    def get(self, state:Tuple[int,int]) -> torch.Tensor:
+        r,c = state
+        dists = []
+        for (dx,dy) in self.dirs:
+            steps = 0; rr, cc = r, c
+            while steps < self.max_range:
+                rr += dx; cc += dy; steps += 1
+                if not (0 <= rr < self.size and 0 <= cc < self.size): break
+                if self.maze[rr,cc] == 1: break
+            dists.append(steps / float(self.max_range))
+        gr,gc = self.goal
+        vec_r = (gr - r); vec_c = (gc - c)
+        eucl = math.hypot(vec_r, vec_c) / math.hypot(self.size, self.size)
+        angle = math.atan2(vec_r, vec_c) / math.pi
+        arr = np.array(dists + [eucl, angle], dtype=np.float32)
+        return torch.tensor(arr, dtype=torch.float32)
+
 ProgressCB = Callable[[int,int,float,float,float,int,Optional[np.ndarray], str], None]
 
 def train(cfg:Config, progress_cb:Optional[ProgressCB]=None)->Dict[str,str]:
     set_seed(cfg.seed)
     rng = random.Random(cfg.seed)
     os.makedirs(cfg.output_dir, exist_ok=True)
-    frames_dir = os.path.join(cfg.output_dir, "frames")
-    if cfg.save_frames_during_training and not os.path.exists(frames_dir):
-        os.makedirs(frames_dir, exist_ok=True)
-    if cfg.tensorboard_logdir is None:
-        cfg.tensorboard_logdir = os.path.join(cfg.output_dir, "tb")
-    tb = SummaryWriter(cfg.tensorboard_logdir)
-
     maze, start, goal = MazeGenerator.generate(cfg.maze_size, seed=cfg.seed)
     env = MazeEnv(maze, start, goal)
 
     if cfg.obs_type == 'vector':
-        obs_shape = {'state_dim':4}
-        egobuilder = None
+        obs_shape = {'state_dim':4}; egobuilder = None; radar_builder = None
     elif cfg.obs_type == 'grid':
-        obs_shape = {'in_channels':2, 'H':maze.shape[0], 'W':maze.shape[1]}
-        egobuilder = None
-    else:
+        obs_shape = {'in_channels':2, 'H':maze.shape[0], 'W':maze.shape[1]}; egobuilder = None; radar_builder = None
+    elif cfg.obs_type == 'egocentric':
         patch_radius = max(3, min(7, maze.shape[0]//6))
         obs_shape = {'in_channels':2, 'H':2*patch_radius+1, 'W':2*patch_radius+1, 'patch_radius':patch_radius}
-        egobuilder = EgocentricBuilder(maze, goal, patch_radius)
+        egobuilder = EgocentricBuilder(maze, goal, patch_radius); radar_builder = None
+    else:  # radar
+        obs_shape = {'state_dim':10}; egobuilder = None; radar_builder = RadarBuilder(maze, goal, max_range=max(5, maze.shape[0]//2))
 
     agent = Agent(4, cfg, obs_shape)
     replay = PrioritizedReplayBuffer(cfg.replay_capacity, cfg.per_alpha) if cfg.per else ReplayBuffer(cfg.replay_capacity)
@@ -566,9 +541,9 @@ def train(cfg:Config, progress_cb:Optional[ProgressCB]=None)->Dict[str,str]:
     max_steps_episode = cfg.maze_size**2 * cfg.max_steps_multiplier
     global_step = 0
 
+    n_step = max(1, cfg.n_step)
+    nbuf = deque()
     recent_thoughts = deque(maxlen=60)
-    last_progress_time = 0.0
-    min_update_interval = 0.4  # seconds between UI updates
 
     eps_iter = trange(cfg.episodes, desc="Training", unit="ep", ncols=80)
     for ep in eps_iter:
@@ -578,8 +553,10 @@ def train(cfg:Config, progress_cb:Optional[ProgressCB]=None)->Dict[str,str]:
                 obs = build_obs_vector(s, goal, maze.shape[0])
             elif cfg.obs_type == 'grid':
                 obs = build_obs_grid(maze, s, goal)
-            else:
+            elif cfg.obs_type == 'egocentric':
                 obs = egobuilder.get(s)
+            else:
+                obs = radar_builder.get(s)
 
             eps = max(cfg.epsilon_final, cfg.epsilon_start + (cfg.epsilon_final - cfg.epsilon_start) * (global_step / max(1, cfg.epsilon_decay_frames)))
             try:
@@ -595,10 +572,21 @@ def train(cfg:Config, progress_cb:Optional[ProgressCB]=None)->Dict[str,str]:
                 obs_next = build_obs_vector(nxt, goal, maze.shape[0])
             elif cfg.obs_type == 'grid':
                 obs_next = build_obs_grid(maze, nxt, goal)
-            else:
+            elif cfg.obs_type == 'egocentric':
                 obs_next = egobuilder.get(nxt)
+            else:
+                obs_next = radar_builder.get(nxt)
 
-            replay.add((obs, action, float(r), obs_next, float(done)))
+            nbuf.append((obs, action, r, obs_next, float(done)))
+            if len(nbuf) >= n_step:
+                ret = 0.0
+                for idx in range(n_step):
+                    ret += (cfg.gamma**idx) * nbuf[idx][2]
+                first_obs, first_action = nbuf[0][0], nbuf[0][1]
+                last_next_obs = nbuf[n_step-1][3]
+                last_done = any([nbuf[i][4] for i in range(n_step)])
+                replay.add((first_obs, first_action, float(ret), last_next_obs, float(last_done)))
+                nbuf.popleft()
 
             prev_r, prev_c = prev_cell; next_r, next_c = nxt
             for f_idx in range(cfg.train_frames_per_step):
@@ -620,14 +608,13 @@ def train(cfg:Config, progress_cb:Optional[ProgressCB]=None)->Dict[str,str]:
                 )
                 last_preview_frame = frame
 
-            if (ep % max(1, cfg.render_interval) == 0) and (ep_steps % 1 == 0):
-                if last_preview_frame is not None:
-                    try:
-                        pil = Image.fromarray(last_preview_frame)
-                        small = pil.resize((min(320, pil.size[0]), int(pil.size[1]*min(320/pil.size[0],1.0))), Image.LANCZOS)
-                        preview_frames_small.append(np.array(small))
-                    except Exception:
-                        pass
+            if (ep % max(1, cfg.render_interval) == 0) and (ep_steps % 1 == 0) and last_preview_frame is not None:
+                try:
+                    pil = Image.fromarray(last_preview_frame)
+                    small = pil.resize((min(320, pil.size[0]), int(pil.size[1]*min(320/pil.size[0],1.0))), Image.LANCZOS)
+                    preview_frames_small.append(np.array(small))
+                except Exception:
+                    pass
 
             prev_cell = nxt; s = nxt; path.append(s)
             global_step += 1; total_steps += 1
@@ -635,56 +622,59 @@ def train(cfg:Config, progress_cb:Optional[ProgressCB]=None)->Dict[str,str]:
             if cfg.per:
                 per_beta = min(1.0, cfg.per_beta_start + (global_step / cfg.per_beta_frames) * (1.0 - cfg.per_beta_start))
 
-            can_update = (cfg.per and len(replay) >= cfg.min_replay_size) or (not cfg.per and len(replay) >= cfg.min_replay_size)
-            if can_update:
+            if len(replay) >= cfg.min_replay_size:
                 try:
                     if cfg.per:
                         batch, idxs, weights = replay.sample(cfg.batch_size, per_beta)
                         batch = [b for b in batch if b is not None]
                         if len(batch) >= cfg.batch_size:
                             loss_val, td_err = agent.update(batch, weights=weights, gamma=cfg.gamma)
-                            replay.update_priorities(idxs, (np.abs(td_err)+1e-6).tolist())
-                            losses.append(loss_val)
+                            try:
+                                replay.update_priorities(idxs, (np.abs(td_err)+1e-6).tolist())
+                            except Exception:
+                                pass
+                            if agent.scheduler is not None:
+                                agent.scheduler.step(loss_val)
                     else:
                         batch = replay.sample(cfg.batch_size)
                         loss_val, td_err = agent.update(batch, weights=None, gamma=cfg.gamma)
-                        losses.append(loss_val)
+                        if agent.scheduler is not None:
+                            agent.scheduler.step(loss_val)
                 except Exception:
                     logger.exception("Update failed")
 
             thought_text = generate_thoughts(qvals, recent_thoughts, rng, temperature=1.0)
-
-            now = time.time()
-            if progress_cb is not None and (now - last_progress_time >= min_update_interval):
+            if progress_cb is not None and (ep_steps % 5 == 0):
+                avg10 = float(np.mean(rewards[-10:])) if len(rewards) >= 10 else (float(np.mean(rewards)) if rewards else 0.0)
                 try:
-                    avg10 = float(np.mean(rewards[-10:])) if len(rewards) >= 10 else (float(np.mean(rewards)) if rewards else 0.0)
                     progress_cb(ep+1, cfg.episodes, ep_reward, avg10, eps, ep_steps, last_preview_frame, thought_text)
-                except Exception as e:
-                    # If client disconnected (StreamClosed / WebSocketClosed), just log at debug and continue training
-                    msg = str(e)
-                    if 'StreamClosedError' in msg or 'WebSocketClosedError' in msg or 'BrokenPipeError' in msg:
-                        logger.info("Client disconnected; skipping UI update (non-fatal).")
-                    else:
-                        logger.exception("progress_cb error")
-                last_progress_time = now
+                except Exception:
+                    logger.exception("progress_cb error")
+
+        while nbuf:
+            ret = 0.0; for_i = len(nbuf)
+            for idx in range(for_i):
+                ret += (cfg.gamma**idx) * nbuf[idx][2]
+            first_obs, first_action = nbuf[0][0], nbuf[0][1]
+            last_next_obs = nbuf[-1][3]
+            last_done = any([nbuf[i][4] for i in range(len(nbuf))])
+            replay.add((first_obs, first_action, float(ret), last_next_obs, float(last_done)))
+            nbuf.popleft()
 
         rewards.append(ep_reward)
-        tb.add_scalar("train/episode_reward", float(ep_reward), ep)
-        eps_iter.set_postfix({"ep_reward":f"{ep_reward:.2f}", "eps":f"{eps:.3f}"})
+        eps_iter.set_postfix({"ep_reward":f"{ep_reward:.2f}"})
 
     duration = time.time() - start_time
     logger.info("Training finished: episodes=%d total_steps=%d duration=%.2fs", cfg.episodes, total_steps, duration)
-    tb.add_scalar("train/duration_sec", duration, 0)
 
     preview_gif = os.path.join(cfg.output_dir, "preview.gif")
     try:
         if preview_frames_small:
             imageio.mimsave(preview_gif, preview_frames_small, fps=6)
-            logger.info("Saved preview GIF: %s", preview_gif)
     except Exception:
         logger.exception("Failed to save preview GIF")
 
-    final_artifacts = final_render_and_save(agent, env, cfg, egobuilder)
+    final_artifacts = final_render_and_save(agent, env, cfg, egobuilder if 'egobuilder' in locals() else None)
 
     plot_path = os.path.join(cfg.output_dir, "rewards.png")
     try:
@@ -704,7 +694,6 @@ def train(cfg:Config, progress_cb:Optional[ProgressCB]=None)->Dict[str,str]:
     except Exception:
         logger.exception("Failed to save model")
 
-    tb.close()
     return {
         "preview_gif": preview_gif if os.path.exists(preview_gif) else "",
         "final_mp4": final_artifacts.get("mp4",""),
@@ -714,7 +703,6 @@ def train(cfg:Config, progress_cb:Optional[ProgressCB]=None)->Dict[str,str]:
         "log": LOG_PATH
     }
 
-# Final rendering
 def final_render_and_save(agent:Agent, env:MazeEnv, cfg:Config, egobuilder:Optional[EgocentricBuilder]):
     try:
         s = env.reset(); path=[s]; done=False; steps=0; max_eval = cfg.maze_size**2 * 5
@@ -723,8 +711,11 @@ def final_render_and_save(agent:Agent, env:MazeEnv, cfg:Config, egobuilder:Optio
                 obs = build_obs_vector(s, env.goal, env.maze.shape[0])
             elif cfg.obs_type == 'grid':
                 obs = build_obs_grid(env.maze, s, env.goal)
-            else:
+            elif cfg.obs_type == 'egocentric':
                 obs = egobuilder.get(s)
+            else:
+                rb = RadarBuilder(env.maze, env.goal, max_range=max(5, env.maze.shape[0]//2))
+                obs = rb.get(s)
             a = agent.act(obs, 0.0)
             s,_,done = env.step(a)
             path.append(s); steps += 1
@@ -743,8 +734,11 @@ def final_render_and_save(agent:Agent, env:MazeEnv, cfg:Config, egobuilder:Optio
             obs = build_obs_vector(prev, env.goal, env.maze.shape[0])
         elif cfg.obs_type == 'grid':
             obs = build_obs_grid(env.maze, prev, env.goal)
-        else:
+        elif cfg.obs_type == 'egocentric':
             obs = egobuilder.get(prev)
+        else:
+            rb = RadarBuilder(env.maze, env.goal, max_range=max(5, env.maze.shape[0]//2))
+            obs = rb.get(prev)
         qvals = agent.q_values(obs) if hasattr(agent, 'q_values') else None
         for f_idx in range(cfg.final_frames_per_step):
             t_lin = f_idx / max(1, cfg.final_frames_per_step - 1)
@@ -775,7 +769,6 @@ def final_render_and_save(agent:Agent, env:MazeEnv, cfg:Config, egobuilder:Optio
     try:
         if frames:
             imageio.mimsave(gif_path, frames, fps=8)
-            logger.info("Saved final GIF: %s", gif_path)
     except Exception:
         logger.exception("Failed to save final GIF")
     if cfg.save_mp4:
@@ -784,27 +777,23 @@ def final_render_and_save(agent:Agent, env:MazeEnv, cfg:Config, egobuilder:Optio
                 with imageio.get_writer(mp4_path, fps=30, codec='libx264', quality=8) as writer:
                     for f in frames:
                         writer.append_data(f)
-                logger.info("Saved final MP4: %s", mp4_path)
         except Exception:
             logger.exception("Failed to save final MP4 (ffmpeg may be missing)")
-
     return {"gif": gif_path if os.path.exists(gif_path) else "", "mp4": mp4_path if os.path.exists(mp4_path) else ""}
 
-# Streamlit UI
 def run_streamlit():
     import streamlit as st
     st.set_page_config(page_title="AI Learns to Navigate Mazes", layout="wide")
     st.title("AI Learns to Navigate Mazes")
 
     left_col, center_col, right_col = st.columns([1,3,1])
+
     with left_col:
         size = st.slider("Maze size (odd)", 11, 41, 21, step=2)
         episodes = st.slider("Episodes", 50, 1000, 300, step=50)
-        obs_type = st.selectbox("Observation type", ['vector','grid','egocentric'], index=0)
+        obs_type = st.selectbox("Observation type", ['vector','grid','egocentric','radar'], index=0)
         start_btn = st.button("🚀 Start training")
-        st.markdown("**Preview updates during training; final smooth video is produced after training.**")
-
-        # Advanced settings in an expander
+        st.markdown("Preview updates during training; final video produced afterwards.")
         with st.expander("Advanced settings"):
             device = st.selectbox("Device", ['auto','cuda','cpu'], index=0)
             batch_size = st.number_input("Batch size", min_value=8, max_value=2048, value=64, step=8)
@@ -818,86 +807,53 @@ def run_streamlit():
             per_beta_start = st.slider("PER beta start", 0.0, 1.0, 0.4)
             min_replay_size = st.number_input("Min replay size before updates", min_value=128, max_value=100000, value=1000, step=128)
             max_grad_norm = st.number_input("Max grad norm", min_value=0.1, max_value=100.0, value=10.0, step=0.1)
+            n_step = st.number_input("n-step returns (n)", min_value=1, max_value=10, value=3, step=1)
+            use_scheduler = st.checkbox("Use LR scheduler", value=True)
 
     with center_col:
         status = st.empty()
         preview = st.empty()
         chart_placeholder = st.empty()
-        if "chart_handle" not in st.session_state:
-            st.session_state.chart_handle = None
-            st.session_state.chart_df = pd.DataFrame(columns=["reward", "avg50"])
         artifacts = st.empty()
 
     with right_col:
         st.markdown("### Agent thoughts (recent)")
         thoughts_box = st.empty()
         st.caption("Latest 10 generated thoughts (newest on top)")
-        ui_recent_thoughts = deque(maxlen=10)
 
-    reward_history = []; avg_history=[]
+    if 'ui_recent_thoughts' not in st.session_state:
+        st.session_state.ui_recent_thoughts = deque(maxlen=10)
+        st.session_state.training = False
+        st.session_state.last_chart_ts = 0.0
+        st.session_state.reward_history = []
+        st.session_state.avg_history = []
 
     def progress_cb(ep, total, ep_reward, avg10, eps, steps, frame, thought_text):
         try:
             if frame is not None:
-                try:
-                    pil = Image.fromarray(frame)
-                    preview.image(pil, width='content')
-                except Exception as e:
-                    logger.debug("Preview image update failed: %s", e)
-
-            reward_history.append(ep_reward)
-            avg = float(np.mean(reward_history[-50:])) if reward_history else ep_reward
-            avg_history.append(avg)
-
-            new_row = pd.DataFrame({"reward":[ep_reward], "avg50":[avg]})
-
-            if st.session_state.chart_handle is None:
-                st.session_state.chart_df = pd.DataFrame({"reward": reward_history, "avg50": avg_history})
-                try:
-                    st.session_state.chart_handle = chart_placeholder.line_chart(st.session_state.chart_df)
-                except Exception as e:
-                    logger.exception("Failed to create initial chart: %s", e)
-                    st.session_state.chart_handle = None
-            else:
-                try:
-                    st.session_state.chart_handle.add_rows(new_row)
-                except Exception as e:
-                    logger.debug("add_rows failed, recreating chart: %s", e)
-                    try:
-                        st.session_state.chart_df = pd.DataFrame({"reward": reward_history, "avg50": avg_history})
-                        st.session_state.chart_handle = chart_placeholder.line_chart(st.session_state.chart_df)
-                    except Exception:
-                        logger.exception("Failed to recreate chart")
-
-            # update status text
-            status.markdown(f"**Ep**: {ep}/{total}  **Reward**: {ep_reward:.2f}  **Avg50**: {avg:.2f}  **Eps**: {eps:.3f}  **Steps**: {steps}")
-
-            # update thoughts: newest first, keep <=10 items
+                preview.image(Image.fromarray(frame), use_column_width=True)
+            now = time.time()
+            if now - st.session_state.last_chart_ts > 0.8:
+                st.session_state.reward_history.append(ep_reward)
+                avg = float(np.mean(st.session_state.reward_history[-50:])) if st.session_state.reward_history else ep_reward
+                st.session_state.avg_history.append(avg)
+                chart_placeholder.line_chart({"reward": st.session_state.reward_history, "avg50": st.session_state.avg_history})
+                st.session_state.last_chart_ts = now
+            status.markdown(f"**Ep**: {ep}/{total}  **Reward**: {ep_reward:.2f}  **Avg10**: {avg10:.2f}  **Eps**: {eps:.3f}  **Steps**: {steps}")
             if thought_text is not None:
                 ts = time.strftime("%H:%M:%S")
                 entry = f"{ts} — {thought_text}"
-                ui_recent_thoughts.appendleft(entry)  # newest at left
-                md = "\n".join([f"- {e}" for e in ui_recent_thoughts])
-                try:
-                    thoughts_box.markdown(md)
-                except Exception as e:
-                    logger.debug("Thoughts update failed: %s", e)
+                st.session_state.ui_recent_thoughts.appendleft(entry)
+                md = "\n".join([f"- {e}" for e in st.session_state.ui_recent_thoughts])
+                thoughts_box.markdown(md)
+        except Exception:
+            logger.exception("progress_cb failed")
 
-        except Exception as e:
-            # catch-all to prevent UI write problems from killing the training
-            msg = str(e)
-            if 'StreamClosedError' in msg or 'WebSocketClosedError' in msg or 'BrokenPipeError' in msg:
-                logger.info("Client disconnected; skipped UI update")
-            else:
-                logger.exception("Unexpected error in progress_cb")
-
-    if start_btn:
+    if start_btn and not st.session_state.training:
+        st.session_state.training = True
         cfg = Config.from_args(argparse.Namespace(size=size, episodes=episodes))
         cfg.obs_type = obs_type
-        if device != 'auto':
-            cfg.device = device
-        else:
-            cfg.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        cfg.device = device if device != 'auto' else ('cuda' if torch.cuda.is_available() else 'cpu')
         cfg.batch_size = int(batch_size)
         cfg.lr = float(lr)
         cfg.gamma = float(gamma)
@@ -909,30 +865,32 @@ def run_streamlit():
         cfg.per_beta_start = float(per_beta_start)
         cfg.min_replay_size = int(min_replay_size)
         cfg.max_grad_norm = float(max_grad_norm)
+        cfg.n_step = int(n_step)
+        cfg.use_scheduler = bool(use_scheduler)
         cfg.tensorboard_logdir = os.path.join(cfg.output_dir, "tb")
 
-        status.info(f"Starting training on device `{cfg.device}` — preview will update.")
-        artifacts_info = train(cfg, progress_cb=progress_cb)
-        status.success("Training finished.")
+        status.info(f"Starting training on {cfg.device}. Preview will update.")
         try:
+            artifacts_info = train(cfg, progress_cb=progress_cb)
+            status.success("Training finished.")
             c1, c2 = artifacts.columns(2)
             with c1:
                 if artifacts_info.get("preview_gif") and os.path.exists(artifacts_info["preview_gif"]):
-                    c1.image(artifacts_info["preview_gif"], caption="Training preview GIF", width='content')
+                    c1.image(artifacts_info["preview_gif"], caption="Training preview GIF", use_column_width=True)
                 if artifacts_info.get("plot") and os.path.exists(artifacts_info["plot"]):
-                    c1.image(artifacts_info["plot"], caption="Rewards", width='content')
+                    c1.image(artifacts_info["plot"], caption="Rewards", use_column_width=True)
             with c2:
                 if artifacts_info.get("final_mp4") and os.path.exists(artifacts_info["final_mp4"]):
                     c2.video(artifacts_info["final_mp4"])
                 if artifacts_info.get("final_gif") and os.path.exists(artifacts_info["final_gif"]):
-                    c2.image(artifacts_info["final_gif"], caption="Final smooth GIF", width='content')
+                    c2.image(artifacts_info["final_gif"], caption="Final smooth GIF", use_column_width=True)
             artifacts.markdown(f"- Model: `{artifacts_info.get('model','')}`  \n- Log: `{artifacts_info.get('log','')}`")
         except Exception:
-            logger.exception("Failed showing artifacts in Streamlit UI")
-            artifacts.error("Failed to show artifacts; check outputs/ and train.log")
+            logger.exception("Training failed in UI")
+            status.error("Training failed; check logs.")
+        finally:
+            st.session_state.training = False
 
-
-# CLI entry
 def main_cli():
     parser = argparse.ArgumentParser()
     parser.add_argument('--size', type=int, default=21, help='Maze size (odd)')
@@ -943,8 +901,7 @@ def main_cli():
     if args.web:
         run_streamlit()
     else:
-        result = train(cfg)
-        logger.info("Training completed, artifacts: %s", result)
+        train(cfg)
 
 if __name__ == "__main__":
     main_cli()
