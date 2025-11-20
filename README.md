@@ -91,3 +91,9 @@ python main.py --size 21 --episodes 300
 * Compare DQN variants (Double DQN, Rainbow components, distributional RL).
 * Add unit/integration tests for environment and replay buffer.
 * Add CI workflow (GitHub Actions) to run basic smoke tests.
+
+---
+
+## License
+
+This project is open-source and available under the MIT License.
